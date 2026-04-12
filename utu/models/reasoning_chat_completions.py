@@ -137,14 +137,24 @@ _active_reasoning_strategy: contextvars.ContextVar[ReasoningStrategy | None] = c
 def _patched_items_to_messages(cls, items, model=None, **kw):  # type: ignore[no-untyped-def]
     """Globally-installed patch for ``Converter.items_to_messages``.
 
-    When ``_active_reasoning_strategy`` is set (by a ReasoningChatCompletionsModel
-    call in this asyncio Task), strips reasoning items, runs the real converter,
-    and injects reasoning via the strategy. Otherwise delegates directly.
+    Handles two scenarios:
+
+    1. **During API call** (``_active_reasoning_strategy`` is set): Uses the
+       strategy to inject reasoning into the correct model-specific field.
+
+    2. **Outside API call** (e.g. trajectory saving): If reasoning items are
+       present in the input, strips them and injects reasoning as
+       ``reasoning_content`` (the standard field). This ensures reasoning is
+       preserved even when no strategy is active.
     """
     strategy = _active_reasoning_strategy.get()
-    if strategy is None:
-        # No reasoning rewrite active for this task — call real original.
+
+    # Quick check: if no strategy AND no reasoning items, take the fast path.
+    if strategy is None and not _has_reasoning_items(items):
         return _REAL_ITEMS_TO_MESSAGES.__func__(cls, items, model=model, **kw)
+
+    # Use a fallback strategy that injects as `reasoning_content` (standard field).
+    effective_strategy = strategy or DeepSeekReasoningStrategy()
 
     # --- Pass 1: extract reasoning & build stripped item list ---
     stripped_items: list = []
@@ -197,10 +207,20 @@ def _patched_items_to_messages(cls, items, model=None, **kw):  # type: ignore[no
         for msg in messages:
             if msg.get("role") == "assistant":
                 if asst_idx in output_reasoning:
-                    strategy.inject_reasoning(msg, output_reasoning[asst_idx])
+                    effective_strategy.inject_reasoning(msg, output_reasoning[asst_idx])
                 asst_idx += 1
 
     return messages
+
+
+def _has_reasoning_items(items) -> bool:
+    """Fast check whether items contain any reasoning items."""
+    if isinstance(items, str):
+        return False
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            return True
+    return False
 
 
 # Install the global patch once at module load.
